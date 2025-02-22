@@ -56,3 +56,9 @@ A terminal-based Git diff viewer built with Go and `tview`. This tool provides a
    ```bash   
    ./git-diff-tui
    ```
+
+## Or you can install:
+   ```bash   
+   go install .
+   go-diff --usage
+   ```
