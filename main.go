@@ -9,27 +9,69 @@ import (
 )
 
 type DiffFile struct {
-	filename string
-	hunks    []DiffHunk
+	filename    string
+	leftLines   []Line
+	rightLines  []Line
 }
 
-type DiffHunk struct {
-	header  string
-	left    []string
-	right   []string
+type Line struct {
+	content string
+	state   LineState // Normal, Added, Removed, or Modified
 }
+
+type LineState int
+
+const (
+	Normal LineState = iota
+	Added
+	Removed
+	Modified
+)
 
 func main() {
-	// Run git diff and capture the output
-	cmd := exec.Command("git", "diff")
+	// Run git diff to get the list of changed files
+	cmd := exec.Command("git", "diff", "--name-only")
 	output, err := cmd.Output()
 	if err != nil {
 		fmt.Println("Error running git diff:", err)
 		return
 	}
 
-	// Parse the git diff output
-	files := parseGitDiff(string(output))
+	changedFiles := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var files []DiffFile
+
+	for _, filename := range changedFiles {
+		if filename == "" {
+			continue
+		}
+
+		// Get the file content before changes
+		cmdOld := exec.Command("git", "show", "HEAD:"+filename)
+		oldContent, err := cmdOld.Output()
+		if err != nil {
+			// File might be new
+			oldContent = []byte{}
+		}
+
+		// Get the current file content
+		cmdNew := exec.Command("cat", filename)
+		newContent, err := cmdNew.Output()
+		if err != nil {
+			// File might be deleted
+			newContent = []byte{}
+		}
+
+		// Get the diff for this file
+		cmdDiff := exec.Command("git", "diff", "--unified=0", filename)
+		diffOutput, err := cmdDiff.Output()
+		if err != nil {
+			fmt.Println("Error getting diff for", filename, ":", err)
+			continue
+		}
+
+		file := parseFileWithDiff(filename, string(oldContent), string(newContent), string(diffOutput))
+		files = append(files, file)
+	}
 
 	// Create the TUI application
 	app := tview.NewApplication()
@@ -42,17 +84,17 @@ func main() {
 		SetLabel("Select file: ").
 		SetFieldWidth(50)
 
-	// Create text views for left and right panels with horizontal scrolling
+	// Create text views for left and right panels
 	leftView := tview.NewTextView().
 		SetDynamicColors(true).
-		SetWrap(false).  // Disable wrapping to enable horizontal scrolling
+		SetWrap(false).
 		SetScrollable(true)
 	rightView := tview.NewTextView().
 		SetDynamicColors(true).
-		SetWrap(false).  // Disable wrapping to enable horizontal scrolling
+		SetWrap(false).
 		SetScrollable(true)
 
-	// Add keyboard navigation for horizontal scrolling
+	// Add horizontal scrolling handlers
 	leftView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyLeft:
@@ -81,15 +123,29 @@ func main() {
 		return event
 	})
 
+	// Sync vertical scrolling between views
+	leftView.SetChangedFunc(func() {
+		row, _ := leftView.GetScrollOffset()
+		_, col := rightView.GetScrollOffset()
+		rightView.ScrollTo(row, col)
+		app.Draw()
+	})
+
+	rightView.SetChangedFunc(func() {
+		row, _ := rightView.GetScrollOffset()
+		_, col := leftView.GetScrollOffset()
+		leftView.ScrollTo(row, col)
+		app.Draw()
+	})
+
 	// Add file names to dropdown
 	var fileNames []string
 	for _, file := range files {
 		fileNames = append(fileNames, file.filename)
 	}
 	dropdown.SetOptions(fileNames, func(text string, index int) {
-		// When a file is selected, update both views
 		if index >= 0 && index < len(files) {
-			displayDiff(files[index], leftView, rightView)
+			displayFullDiff(files[index], leftView, rightView)
 		}
 	})
 
@@ -106,26 +162,24 @@ func main() {
 	leftView.SetBorder(true).SetTitle(" Original ")
 	rightView.SetBorder(true).SetTitle(" Modified ")
 
-	// Add key bindings help text
+	// Add help text
 	helpText := tview.NewTextView().
 		SetDynamicColors(true).
 		SetText("[yellow]Navigation: Arrow keys to scroll | Tab to switch focus | Ctrl-C to quit[white]").
 		SetTextAlign(tview.AlignCenter)
 	flex.AddItem(helpText, 1, 0, false)
 
-	// If there are files, display the first one
+	// Show first file if available
 	if len(files) > 0 {
-		displayDiff(files[0], leftView, rightView)
+		displayFullDiff(files[0], leftView, rightView)
 		dropdown.SetCurrentOption(0)
 	}
 
-	// Enable switching focus between views
+	// Enable focus switching
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyTab:
-			// Cycle focus between dropdown, left view, and right view
-			currentFocus := app.GetFocus()
-			switch currentFocus {
+		if event.Key() == tcell.KeyTab {
+			current := app.GetFocus()
+			switch current {
 			case dropdown:
 				app.SetFocus(leftView)
 			case leftView:
@@ -138,97 +192,104 @@ func main() {
 		return event
 	})
 
-	// Run the application
 	if err := app.SetRoot(flex, true).EnableMouse(true).Run(); err != nil {
 		panic(err)
 	}
 }
 
-func displayDiff(file DiffFile, leftView, rightView *tview.TextView) {
-	var leftContent, rightContent strings.Builder
+func parseFileWithDiff(filename, oldContent, newContent, diff string) DiffFile {
+	// Parse the diff to get the changed line numbers
+	changes := make(map[int]LineState) // line number -> state
+	lines := strings.Split(diff, "\n")
+	var currentOldLine, currentNewLine int
 
-	for _, hunk := range file.hunks {
-		leftContent.WriteString("[purple]" + hunk.header + "[white]\n")
-		rightContent.WriteString("[purple]" + hunk.header + "[white]\n")
-
-		// Add left content
-		for _, line := range hunk.left {
-			if strings.HasPrefix(line, "-") {
-				leftContent.WriteString("[red]" + strings.TrimPrefix(line, "-") + "[white]\n")
-			} else {
-				leftContent.WriteString(line + "\n")
-			}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@") {
+			// Parse the hunk header
+			var oldStart, oldCount, newStart, newCount int
+			fmt.Sscanf(line, "@@ -%d,%d +%d,%d @@", &oldStart, &oldCount, &newStart, &newCount)
+			currentOldLine = oldStart
+			currentNewLine = newStart
+			continue
 		}
 
-		// Add right content
-		for _, line := range hunk.right {
-			if strings.HasPrefix(line, "+") {
-				rightContent.WriteString("[green]" + strings.TrimPrefix(line, "+") + "[white]\n")
-			} else {
-				rightContent.WriteString(line + "\n")
-			}
+		if strings.HasPrefix(line, "-") {
+			changes[currentOldLine] = Removed
+			currentOldLine++
+		} else if strings.HasPrefix(line, "+") {
+			changes[currentNewLine] = Added
+			currentNewLine++
+		} else if !strings.HasPrefix(line, "diff") && !strings.HasPrefix(line, "index") {
+			currentOldLine++
+			currentNewLine++
+		}
+	}
+
+	// Create the file structure with both versions
+	file := DiffFile{
+		filename: filename,
+	}
+
+	// Process old content
+	oldLines := strings.Split(oldContent, "\n")
+	for i, line := range oldLines {
+		lineNum := i + 1
+		state := Normal
+		if s, exists := changes[lineNum]; exists {
+			state = s
+		}
+		file.leftLines = append(file.leftLines, Line{
+			content: line,
+			state:   state,
+		})
+	}
+
+	// Process new content
+	newLines := strings.Split(newContent, "\n")
+	for i, line := range newLines {
+		lineNum := i + 1
+		state := Normal
+		if s, exists := changes[lineNum]; exists {
+			state = s
+		}
+		file.rightLines = append(file.rightLines, Line{
+			content: line,
+			state:   state,
+		})
+	}
+
+	return file
+}
+
+func displayFullDiff(file DiffFile, leftView, rightView *tview.TextView) {
+	var leftContent, rightContent strings.Builder
+
+	// Add line numbers and content for left view
+	for i, line := range file.leftLines {
+		lineNum := fmt.Sprintf("%4d | ", i+1)
+		switch line.state {
+		case Removed:
+			leftContent.WriteString("[red]" + lineNum + line.content + "[white]\n")
+		case Modified:
+			leftContent.WriteString("[yellow]" + lineNum + line.content + "[white]\n")
+		default:
+			leftContent.WriteString(lineNum + line.content + "\n")
+		}
+	}
+
+	// Add line numbers and content for right view
+	for i, line := range file.rightLines {
+		lineNum := fmt.Sprintf("%4d | ", i+1)
+		switch line.state {
+		case Added:
+			rightContent.WriteString("[green]" + lineNum + line.content + "[white]\n")
+		case Modified:
+			rightContent.WriteString("[yellow]" + lineNum + line.content + "[white]\n")
+		default:
+			rightContent.WriteString(lineNum + line.content + "\n")
 		}
 	}
 
 	leftView.SetText(leftContent.String())
 	rightView.SetText(rightContent.String())
-}
-
-func parseGitDiff(diff string) []DiffFile {
-	var files []DiffFile
-	var currentFile *DiffFile
-	var currentHunk *DiffHunk
-	lines := strings.Split(diff, "\n")
-
-	for _, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "diff --git"):
-			// Start a new file
-			if currentFile != nil {
-				if currentHunk != nil {
-					currentFile.hunks = append(currentFile.hunks, *currentHunk)
-				}
-				files = append(files, *currentFile)
-			}
-			currentFile = &DiffFile{
-				filename: strings.TrimPrefix(line, "diff --git "),
-			}
-			currentHunk = nil
-
-		case strings.HasPrefix(line, "@@"):
-			// Start a new hunk
-			if currentHunk != nil && currentFile != nil {
-				currentFile.hunks = append(currentFile.hunks, *currentHunk)
-			}
-			currentHunk = &DiffHunk{
-				header: line,
-			}
-
-		case strings.HasPrefix(line, "-"):
-			if currentHunk != nil {
-				currentHunk.left = append(currentHunk.left, line)
-			}
-
-		case strings.HasPrefix(line, "+"):
-			if currentHunk != nil {
-				currentHunk.right = append(currentHunk.right, line)
-			}
-
-		case strings.HasPrefix(line, " "):
-			if currentHunk != nil {
-				currentHunk.left = append(currentHunk.left, line)
-				currentHunk.right = append(currentHunk.right, line)
-			}
-		}
-	}
-
-	// Add the last file and hunk
-	if currentFile != nil {
-		if currentHunk != nil {
-			currentFile.hunks = append(currentFile.hunks, *currentHunk)
-		}
-		files = append(files, *currentFile)
-	}
-
-	return files
 }
