@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-	_"github.com/gdamore/tcell/v2"
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -42,15 +42,44 @@ func main() {
 		SetLabel("Select file: ").
 		SetFieldWidth(50)
 
-	// Create text views for left and right panels
+	// Create text views for left and right panels with horizontal scrolling
 	leftView := tview.NewTextView().
 		SetDynamicColors(true).
-		SetWrap(false).
+		SetWrap(false).  // Disable wrapping to enable horizontal scrolling
 		SetScrollable(true)
 	rightView := tview.NewTextView().
 		SetDynamicColors(true).
-		SetWrap(false).
+		SetWrap(false).  // Disable wrapping to enable horizontal scrolling
 		SetScrollable(true)
+
+	// Add keyboard navigation for horizontal scrolling
+	leftView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyLeft:
+			row, col := leftView.GetScrollOffset()
+			if col > 0 {
+				leftView.ScrollTo(row, col-1)
+			}
+		case tcell.KeyRight:
+			row, col := leftView.GetScrollOffset()
+			leftView.ScrollTo(row, col+1)
+		}
+		return event
+	})
+
+	rightView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyLeft:
+			row, col := rightView.GetScrollOffset()
+			if col > 0 {
+				rightView.ScrollTo(row, col-1)
+			}
+		case tcell.KeyRight:
+			row, col := rightView.GetScrollOffset()
+			rightView.ScrollTo(row, col+1)
+		}
+		return event
+	})
 
 	// Add file names to dropdown
 	var fileNames []string
@@ -77,11 +106,37 @@ func main() {
 	leftView.SetBorder(true).SetTitle(" Original ")
 	rightView.SetBorder(true).SetTitle(" Modified ")
 
+	// Add key bindings help text
+	helpText := tview.NewTextView().
+		SetDynamicColors(true).
+		SetText("[yellow]Navigation: Arrow keys to scroll | Tab to switch focus | Ctrl-C to quit[white]").
+		SetTextAlign(tview.AlignCenter)
+	flex.AddItem(helpText, 1, 0, false)
+
 	// If there are files, display the first one
 	if len(files) > 0 {
 		displayDiff(files[0], leftView, rightView)
 		dropdown.SetCurrentOption(0)
 	}
+
+	// Enable switching focus between views
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyTab:
+			// Cycle focus between dropdown, left view, and right view
+			currentFocus := app.GetFocus()
+			switch currentFocus {
+			case dropdown:
+				app.SetFocus(leftView)
+			case leftView:
+				app.SetFocus(rightView)
+			case rightView:
+				app.SetFocus(dropdown)
+			}
+			return nil
+		}
+		return event
+	})
 
 	// Run the application
 	if err := app.SetRoot(flex, true).EnableMouse(true).Run(); err != nil {
