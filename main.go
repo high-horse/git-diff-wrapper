@@ -9,14 +9,16 @@ import (
 )
 
 type DiffFile struct {
-	filename    string
-	leftLines   []Line
-	rightLines  []Line
+	filename string
+	lines    []DiffLine
 }
 
-type Line struct {
-	content string
-	state   LineState // Normal, Added, Removed, or Modified
+type DiffLine struct {
+	leftNum     int
+	rightNum    int
+	leftContent string
+	rightContent string
+	state       LineState
 }
 
 type LineState int
@@ -49,7 +51,6 @@ func main() {
 		cmdOld := exec.Command("git", "show", "HEAD:"+filename)
 		oldContent, err := cmdOld.Output()
 		if err != nil {
-			// File might be new
 			oldContent = []byte{}
 		}
 
@@ -57,7 +58,6 @@ func main() {
 		cmdNew := exec.Command("cat", filename)
 		newContent, err := cmdNew.Output()
 		if err != nil {
-			// File might be deleted
 			newContent = []byte{}
 		}
 
@@ -73,18 +73,13 @@ func main() {
 		files = append(files, file)
 	}
 
-	// Create the TUI application
 	app := tview.NewApplication()
-
-	// Create the main flex container
 	flex := tview.NewFlex().SetDirection(tview.FlexRow)
 
-	// Create a dropdown to select files
 	dropdown := tview.NewDropDown().
 		SetLabel("Select file: ").
 		SetFieldWidth(50)
 
-	// Create text views for left and right panels
 	leftView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetWrap(false).
@@ -94,88 +89,85 @@ func main() {
 		SetWrap(false).
 		SetScrollable(true)
 
-	// Add horizontal scrolling handlers
+	// Sync horizontal scrolling between views
 	leftView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyLeft:
+		case tcell.KeyLeft, tcell.KeyRight:
 			row, col := leftView.GetScrollOffset()
-			if col > 0 {
-				leftView.ScrollTo(row, col-1)
+			if event.Key() == tcell.KeyLeft && col > 0 {
+				col--
+			} else if event.Key() == tcell.KeyRight {
+				col++
 			}
-		case tcell.KeyRight:
-			row, col := leftView.GetScrollOffset()
-			leftView.ScrollTo(row, col+1)
+			leftView.ScrollTo(row, col)
+			rightView.ScrollTo(row, col)
+			app.Draw()
+			return nil
 		}
 		return event
 	})
 
 	rightView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyLeft:
+		case tcell.KeyLeft, tcell.KeyRight:
 			row, col := rightView.GetScrollOffset()
-			if col > 0 {
-				rightView.ScrollTo(row, col-1)
+			if event.Key() == tcell.KeyLeft && col > 0 {
+				col--
+			} else if event.Key() == tcell.KeyRight {
+				col++
 			}
-		case tcell.KeyRight:
-			row, col := rightView.GetScrollOffset()
-			rightView.ScrollTo(row, col+1)
+			leftView.ScrollTo(row, col)
+			rightView.ScrollTo(row, col)
+			app.Draw()
+			return nil
 		}
 		return event
 	})
 
-	// Sync vertical scrolling between views
+	// Sync vertical scrolling
 	leftView.SetChangedFunc(func() {
-		row, _ := leftView.GetScrollOffset()
-		_, col := rightView.GetScrollOffset()
+		row, col := leftView.GetScrollOffset()
 		rightView.ScrollTo(row, col)
 		app.Draw()
 	})
 
 	rightView.SetChangedFunc(func() {
-		row, _ := rightView.GetScrollOffset()
-		_, col := leftView.GetScrollOffset()
+		row, col := rightView.GetScrollOffset()
 		leftView.ScrollTo(row, col)
 		app.Draw()
 	})
 
-	// Add file names to dropdown
 	var fileNames []string
 	for _, file := range files {
 		fileNames = append(fileNames, file.filename)
 	}
 	dropdown.SetOptions(fileNames, func(text string, index int) {
 		if index >= 0 && index < len(files) {
-			displayFullDiff(files[index], leftView, rightView)
+			displaySyncedDiff(files[index], leftView, rightView)
 		}
 	})
 
-	// Create a flex container for the diff views
 	diffFlex := tview.NewFlex().
 		AddItem(leftView, 0, 1, false).
 		AddItem(rightView, 0, 1, false)
 
-	// Add the dropdown and diff views to the main flex
 	flex.AddItem(dropdown, 1, 0, true).
 		AddItem(diffFlex, 0, 1, false)
 
-	// Set up borders and titles
 	leftView.SetBorder(true).SetTitle(" Original ")
 	rightView.SetBorder(true).SetTitle(" Modified ")
 
-	// Add help text
 	helpText := tview.NewTextView().
 		SetDynamicColors(true).
 		SetText("[yellow]Navigation: Arrow keys to scroll | Tab to switch focus | Ctrl-C to quit[white]").
 		SetTextAlign(tview.AlignCenter)
 	flex.AddItem(helpText, 1, 0, false)
 
-	// Show first file if available
 	if len(files) > 0 {
-		displayFullDiff(files[0], leftView, rightView)
+		displaySyncedDiff(files[0], leftView, rightView)
 		dropdown.SetCurrentOption(0)
 	}
 
-	// Enable focus switching
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyTab {
 			current := app.GetFocus()
@@ -198,95 +190,203 @@ func main() {
 }
 
 func parseFileWithDiff(filename, oldContent, newContent, diff string) DiffFile {
-	// Parse the diff to get the changed line numbers
-	changes := make(map[int]LineState) // line number -> state
-	lines := strings.Split(diff, "\n")
-	var currentOldLine, currentNewLine int
+    oldLines := strings.Split(strings.TrimSpace(oldContent), "\n")
+    newLines := strings.Split(strings.TrimSpace(newContent), "\n")
+    
+    // Handle empty files
+    if len(oldLines) == 1 && oldLines[0] == "" {
+        oldLines = []string{}
+    }
+    if len(newLines) == 1 && newLines[0] == "" {
+        newLines = []string{}
+    }
 
-	for _, line := range lines {
-		if strings.HasPrefix(line, "@@") {
-			// Parse the hunk header
-			var oldStart, oldCount, newStart, newCount int
-			fmt.Sscanf(line, "@@ -%d,%d +%d,%d @@", &oldStart, &oldCount, &newStart, &newCount)
-			currentOldLine = oldStart
-			currentNewLine = newStart
-			continue
-		}
+    // Parse diff to get changes
+    hunks := parseHunks(diff)
+    
+    file := DiffFile{
+        filename: filename,
+        lines:    make([]DiffLine, 0),
+    }
 
-		if strings.HasPrefix(line, "-") {
-			changes[currentOldLine] = Removed
-			currentOldLine++
-		} else if strings.HasPrefix(line, "+") {
-			changes[currentNewLine] = Added
-			currentNewLine++
-		} else if !strings.HasPrefix(line, "diff") && !strings.HasPrefix(line, "index") {
-			currentOldLine++
-			currentNewLine++
-		}
-	}
+    oldIdx, newIdx := 0, 0
+    
+    // Process all hunks
+    for _, hunk := range hunks {
+        // Add unchanged lines before the hunk
+        for oldIdx < hunk.oldStart-1 && oldIdx < len(oldLines) {
+            file.lines = append(file.lines, DiffLine{
+                leftNum:      oldIdx + 1,
+                rightNum:     newIdx + 1,
+                leftContent:  oldLines[oldIdx],
+                rightContent: oldLines[oldIdx],
+                state:       Normal,
+            })
+            oldIdx++
+            newIdx++
+        }
 
-	// Create the file structure with both versions
-	file := DiffFile{
-		filename: filename,
-	}
+        // Process the changes in the hunk
+        oldEnd := min(hunk.oldStart+hunk.oldCount, len(oldLines)+1)
+        newEnd := min(hunk.newStart+hunk.newCount, len(newLines)+1)
+        
+        oldStart := max(0, hunk.oldStart-1)
+        newStart := max(0, hunk.newStart-1)
 
-	// Process old content
-	oldLines := strings.Split(oldContent, "\n")
-	for i, line := range oldLines {
-		lineNum := i + 1
-		state := Normal
-		if s, exists := changes[lineNum]; exists {
-			state = s
-		}
-		file.leftLines = append(file.leftLines, Line{
-			content: line,
-			state:   state,
-		})
-	}
+        // Get the changed lines safely
+        var oldHunkLines, newHunkLines []string
+        if oldEnd > oldStart {
+            oldHunkLines = oldLines[oldStart:oldEnd]
+        }
+        if newEnd > newStart {
+            newHunkLines = newLines[newStart:newEnd]
+        }
 
-	// Process new content
-	newLines := strings.Split(newContent, "\n")
-	for i, line := range newLines {
-		lineNum := i + 1
-		state := Normal
-		if s, exists := changes[lineNum]; exists {
-			state = s
-		}
-		file.rightLines = append(file.rightLines, Line{
-			content: line,
-			state:   state,
-		})
-	}
+        // Create a mapping of modified lines
+        modifiedPairs := findModifiedPairs(oldHunkLines, newHunkLines)
 
-	return file
+        tempOldIdx := oldStart
+        tempNewIdx := newStart
+
+        for tempOldIdx < oldEnd || tempNewIdx < newEnd {
+            if pair, ok := modifiedPairs[tempOldIdx-oldStart]; ok && pair == tempNewIdx-newStart {
+                // Modified line pair
+                file.lines = append(file.lines, DiffLine{
+                    leftNum:      tempOldIdx + 1,
+                    rightNum:     tempNewIdx + 1,
+                    leftContent:  oldLines[tempOldIdx],
+                    rightContent: newLines[tempNewIdx],
+                    state:       Modified,
+                })
+                tempOldIdx++
+                tempNewIdx++
+            } else if tempNewIdx < newEnd && !isInModifiedPairs(modifiedPairs, tempNewIdx-newStart) {
+                // Added line
+                file.lines = append(file.lines, DiffLine{
+                    leftNum:      tempOldIdx + 1,
+                    rightNum:     tempNewIdx + 1,
+                    leftContent:  "",
+                    rightContent: newLines[tempNewIdx],
+                    state:       Added,
+                })
+                tempNewIdx++
+            } else if tempOldIdx < oldEnd {
+                // Removed line
+                file.lines = append(file.lines, DiffLine{
+                    leftNum:      tempOldIdx + 1,
+                    rightNum:     tempNewIdx + 1,
+                    leftContent:  oldLines[tempOldIdx],
+                    rightContent: "",
+                    state:       Removed,
+                })
+                tempOldIdx++
+            } else {
+                break
+            }
+        }
+
+        oldIdx = oldEnd
+        newIdx = newEnd
+    }
+
+    // Add remaining unchanged lines
+    for oldIdx < len(oldLines) {
+        file.lines = append(file.lines, DiffLine{
+            leftNum:      oldIdx + 1,
+            rightNum:     newIdx + 1,
+            leftContent:  oldLines[oldIdx],
+            rightContent: oldLines[oldIdx],
+            state:       Normal,
+        })
+        oldIdx++
+        newIdx++
+    }
+
+    return file
 }
 
-func displayFullDiff(file DiffFile, leftView, rightView *tview.TextView) {
-	var leftContent, rightContent strings.Builder
+type Hunk struct {
+	oldStart, oldCount int
+	newStart, newCount int
+}
 
-	// Add line numbers and content for left view
-	for i, line := range file.leftLines {
-		lineNum := fmt.Sprintf("%4d | ", i+1)
-		switch line.state {
-		case Removed:
-			leftContent.WriteString("[red]" + lineNum + line.content + "[white]\n")
-		case Modified:
-			leftContent.WriteString("[yellow]" + lineNum + line.content + "[white]\n")
-		default:
-			leftContent.WriteString(lineNum + line.content + "\n")
+
+// Helper functions for safe array bounds
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+func max(a, b int) int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+func parseHunks(diff string) []Hunk {
+    var hunks []Hunk
+    lines := strings.Split(diff, "\n")
+    
+    for _, line := range lines {
+        if strings.HasPrefix(line, "@@") {
+            var hunk Hunk
+            _, err := fmt.Sscanf(line, "@@ -%d,%d +%d,%d @@",
+                &hunk.oldStart, &hunk.oldCount,
+                &hunk.newStart, &hunk.newCount)
+            if err == nil {
+                hunks = append(hunks, hunk)
+            }
+        }
+    }
+    
+    return hunks
+}
+
+func findModifiedPairs(oldLines, newLines []string) map[int]int {
+	pairs := make(map[int]int)
+	// Simple implementation - could be improved with diff matching algorithm
+	for i, oldLine := range oldLines {
+		for j, newLine := range newLines {
+			if strings.TrimSpace(oldLine) == strings.TrimSpace(newLine) {
+				pairs[i] = j
+				break
+			}
 		}
 	}
+	return pairs
+}
 
-	// Add line numbers and content for right view
-	for i, line := range file.rightLines {
-		lineNum := fmt.Sprintf("%4d | ", i+1)
+func isInModifiedPairs(pairs map[int]int, idx int) bool {
+	for _, v := range pairs {
+		if v == idx {
+			return true
+		}
+	}
+	return false
+}
+
+func displaySyncedDiff(file DiffFile, leftView, rightView *tview.TextView) {
+	var leftContent, rightContent strings.Builder
+	maxLineNumWidth := len(fmt.Sprint(len(file.lines)))
+	lineNumFormat := fmt.Sprintf("%%%dd │ %%s\n", maxLineNumWidth)
+
+	for _, line := range file.lines {
 		switch line.state {
+		case Normal:
+			leftContent.WriteString(fmt.Sprintf(lineNumFormat, line.leftNum, line.leftContent))
+			rightContent.WriteString(fmt.Sprintf(lineNumFormat, line.rightNum, line.rightContent))
 		case Added:
-			rightContent.WriteString("[green]" + lineNum + line.content + "[white]\n")
+			leftContent.WriteString(fmt.Sprintf(lineNumFormat, line.leftNum, ""))
+			rightContent.WriteString("[green]" + fmt.Sprintf(lineNumFormat, line.rightNum, line.rightContent) + "[white]")
+		case Removed:
+			leftContent.WriteString("[red]" + fmt.Sprintf(lineNumFormat, line.leftNum, line.leftContent) + "[white]")
+			rightContent.WriteString(fmt.Sprintf(lineNumFormat, line.rightNum, ""))
 		case Modified:
-			rightContent.WriteString("[yellow]" + lineNum + line.content + "[white]\n")
-		default:
-			rightContent.WriteString(lineNum + line.content + "\n")
+			leftContent.WriteString("[yellow]" + fmt.Sprintf(lineNumFormat, line.leftNum, line.leftContent) + "[white]")
+			rightContent.WriteString("[yellow]" + fmt.Sprintf(lineNumFormat, line.rightNum, line.rightContent) + "[white]")
 		}
 	}
 
