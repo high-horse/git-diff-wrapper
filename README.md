@@ -2,7 +2,7 @@
 
 A terminal-based Git diff viewer built with Go and `tview`. This tool provides a user-friendly interface to visualize `git diff` output, similar to VS Code's diff view, with color-coded changes, scrollable content, and a clean TUI layout.
 
-![Git Diff TUI Screenshot](screenshot.png) <!-- Add a screenshot if available -->
+<!-- ![Git Diff TUI Screenshot](screenshot.png) <!-- Add a screenshot if available --> -->
 
 ---
 
