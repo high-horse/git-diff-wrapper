@@ -60,5 +60,5 @@ A terminal-based Git diff viewer built with Go and `tview`. This tool provides a
 ## Or you can install:
    ```bash   
    go install .
-   go-diff --usage
+   go-diff # usage
    ```
